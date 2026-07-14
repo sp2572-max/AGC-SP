@@ -1,20 +1,7 @@
 #!/usr/bin/env python3
-"""
-logbook.py  —  Water log-book 
-Handwritten Spanish water-treatment log-book photos -> clean, analyzable Excel.
-Extraction runs 100% locally via Ollama + Qwen2.5-VL
 
-SETUP (one time)
-    1. Install Ollama:   https://ollama.com/download
-    2. ollama pull qwen2.5vl:7b     # :3b lighter, :72b most accurate
-    3. pip install ollama pandas openpyxl
-
-
-Re-running SKIPS photos already in the file, so you can drop in more photos later
-and run the same command — only the new ones are processed. Cells needing review
-are filled RED in the Excel.
-"""
-import argparse, glob, json, os, re, sys
+import argparse, base64, glob, io, json, os, re, sys, time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional, Dict
@@ -36,7 +23,6 @@ class Field:
     valid: Optional[tuple] = None  # (min,max) numeric sanity range -> auto review flag
 
 
-# Defined master parameter list. Grows as new plants add fields they measure.
 CANONICAL_SCHEMA = [
     Field("plant",                   "Planta",                      "",     "str"),
     Field("record_date",             "Fecha",                       "",     "date"),
@@ -63,10 +49,6 @@ class PlantConfig:
     columns: list                       # [(raw_spanish_header, canonical_key_or_None), ...]
     extraction_hints: str = ""
     date_format: str = "%d/%m/%y"
-    # how to read BARE times like "7:00" (explicit am/pm is always honored):
-    #   "daytime" -> 7-11 AM, 12 noon, 1-6 PM   (matches San Juan Planes shifts)
-    #   "all_am"  -> every bare time is AM
-    #   "all_pm"  -> every bare time is PM
     bare_time_rule: str = "daytime"
 
 
@@ -83,7 +65,6 @@ SAN_JUAN_PLANES = PlantConfig(
         ("% del deslizador (Coagulante)",   "coag_slider_pct"),
         ("Dosis segun % mg/L (Coagulante)", "coag_dose_pct_mgl"),
         ("Dosis segun probeta mg/L (Coag)", "coag_dose_probeta_mgl"),
-        # Cloro section + 'Hay...' column intentionally ignored.
     ],
     extraction_hints=(
         "Handwritten water-treatment operations log. Read ONLY these columns "
@@ -103,7 +84,7 @@ PLANTS = {"san_juan_planes": SAN_JUAN_PLANES}
 
 
 # =========================================================================== #
-# SECTION 2 — NORMALIZE: raw JSON -> typed, validated canonical rows
+# SECTION 2 — NORMALIZE: raw JSON -> typed, validated canonical rows  (unchanged)
 # =========================================================================== #
 def _coerce(value, dtype):
     if value is None or value == "":
@@ -189,7 +170,6 @@ def normalize_extraction(raw: Dict, plant: PlantConfig, source_image: str) -> li
                     if not (lo <= coerced <= hi):
                         review.append(f"{fld.key}(out_of_range)")
 
-        # derive normalized 24h time from the raw time
         t24, ok = _to_24h(out.get("record_time"), plant.bare_time_rule)
         out["record_time_24h"] = t24
         if not ok:
@@ -206,13 +186,49 @@ def normalize_extraction(raw: Dict, plant: PlantConfig, source_image: str) -> li
 
 
 # =========================================================================== #
-# SECTION 3 — EXTRACT: photo -> JSON via local Ollama + Qwen2.5-VL
+# SECTION 3 — EXTRACT: photo -> JSON via OpenRouter 
 # =========================================================================== #
-DEFAULT_MODEL = os.environ.get("OLLAMA_VISION_MODEL", "qwen2.5vl:7b")
-# Ollama's default context window (4096 tokens) is too small once an image is
-# encoded into the prompt — raise it. 8192 covers a single table photo; bump
-# via OLLAMA_NUM_CTX if you still see "exceeds the available context size".
-DEFAULT_NUM_CTX = int(os.environ.get("OLLAMA_NUM_CTX", "8192"))
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+DEFAULT_MODEL = os.environ.get("OPENROUTER_VISION_MODEL", "nvidia/nemotron-nano-12b-v2-vl:free")
+DEFAULT_WORKERS = int(os.environ.get("LOGBOOK_WORKERS", "3"))
+
+_MIME = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp"}
+
+
+def _make_client():
+    """One OpenAI-compatible client pointed at OpenRouter. Reused across photos."""
+    from openai import OpenAI  # lazy: dry-run (--from-json) path needs no openai installed
+    key = os.environ.get("OPENROUTER_API_KEY")
+    if not key:
+        raise RuntimeError(
+            "OPENROUTER_API_KEY is not set. Get a key at openrouter.ai -> Keys, then:\n"
+            '  export OPENROUTER_API_KEY="sk-or-..."'
+        )
+    return OpenAI(base_url=OPENROUTER_BASE_URL, api_key=key)
+
+
+def _image_data_url(path: str) -> str:
+    """Read an image and return a base64 data URL. Nemotron accepts JPEG/PNG/WEBP;
+    HEIC is converted on the fly if pillow-heif is installed."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".heic":
+        try:
+            from PIL import Image
+            import pillow_heif
+            pillow_heif.register_heif_opener()
+            buf = io.BytesIO()
+            Image.open(path).convert("RGB").save(buf, format="JPEG", quality=92)
+            return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
+        except Exception as e:
+            raise RuntimeError(
+                f"{os.path.basename(path)} is HEIC and couldn't be converted "
+                f"(pip install pillow pillow-heif, or convert to JPG first): {e}"
+            )
+    mime = _MIME.get(ext)
+    if not mime:
+        raise RuntimeError(f"Unsupported image type '{ext}' for {os.path.basename(path)}")
+    with open(path, "rb") as f:
+        return f"data:{mime};base64," + base64.b64encode(f.read()).decode()
 
 
 def _build_prompt(plant: PlantConfig) -> str:
@@ -246,12 +262,16 @@ RULES
 - Carry the date down to rows where it is blank but clearly the same day.
 - Keep numbers exactly as written (e.g. 41.06, 0.68). Never round or invent.
 - Ambiguous digit: give your best read AND list that field in "uncertain_fields".
-- Output ONLY a JSON object: {{"rows": [ {{...}} ], "page_note": "..."}}
+- Do NOT include any explanation or reasoning. Output ONLY a JSON object:
+  {{"rows": [ {{...}} ], "page_note": "..."}}
 """
 
 
 def _parse_json(text: str) -> Dict:
-    text = text.strip()
+    text = (text or "").strip()
+    # some reasoning models prepend a <think>...</think> trace — drop it
+    if "</think>" in text:
+        text = text.split("</think>")[-1].strip()
     if text.startswith("```"):
         text = text.split("```")[1]
         if text.lstrip().lower().startswith("json"):
@@ -266,24 +286,46 @@ def _parse_json(text: str) -> Dict:
         raise
 
 
+# transient conditions worth retrying with backoff (rate limits / provider hiccups)
+_RETRYABLE = ("429", "rate", "timeout", "timed out", "502", "503", "overloaded", "temporarily")
+
+
 def extract_photo(path: str, plant: PlantConfig, model: str = DEFAULT_MODEL,
-                  client=None, num_ctx: int = DEFAULT_NUM_CTX) -> Dict:
+                  client=None, max_retries: int = 5) -> Dict:
     if client is None:
-        import ollama  # lazy import: dry-run path needs no Ollama installed
-        client = ollama
-    with open(path, "rb") as f:
-        img_bytes = f.read()
-    resp = client.chat(
-        model=model, format="json", options={"temperature": 0, "num_ctx": num_ctx},
-        messages=[{"role": "user", "content": _build_prompt(plant), "images": [img_bytes]}],
-    )
-    data = _parse_json(resp["message"]["content"])
-    data["_model"] = f"ollama:{model}"
-    return data
+        client = _make_client()
+    data_url = _image_data_url(path)
+    messages = [{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": _build_prompt(plant)},
+            {"type": "image_url", "image_url": {"url": data_url}},
+        ],
+    }]
+    last_err = None
+    for attempt in range(max_retries):
+        try:
+            resp = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=0,
+                # turn off Nemotron's reasoning trace -> cleaner JSON, faster/cheaper
+                extra_body={"reasoning": {"enabled": False}},
+            )
+            data = _parse_json(resp.choices[0].message.content)
+            data["_model"] = f"openrouter:{model}"
+            return data
+        except Exception as e:  # noqa: BLE001 — we classify below
+            last_err = e
+            if any(tok in str(e).lower() for tok in _RETRYABLE) and attempt < max_retries - 1:
+                time.sleep(min(2 ** attempt, 30))  # 1,2,4,8,16,30s...
+                continue
+            raise
+    raise RuntimeError(f"failed after {max_retries} retries: {last_err}")
 
 
 # =========================================================================== #
-# SECTION 4 — WRITE: append to the plant's Excel file with RED review cells
+# SECTION 4 — WRITE: append to the plant's Excel file with RED review cells  (unchanged)
 # =========================================================================== #
 RED = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
 RED_FONT = Font(color="9C0006", bold=True)
@@ -353,9 +395,7 @@ def _rows_from_json(plant, json_globs):
     return rows
 
 
-def _rows_from_photos(plant, photos_dir, done):
-    import time
-    rows = []
+def _rows_from_photos(plant, photos_dir, done, model=DEFAULT_MODEL, workers=DEFAULT_WORKERS):
     all_imgs = [p for p in sorted(glob.glob(os.path.join(photos_dir, "*")))
                 if p.lower().endswith((".jpg", ".jpeg", ".png", ".webp", ".heic"))]
     todo = [p for p in all_imgs if os.path.basename(p) not in done]
@@ -366,46 +406,53 @@ def _rows_from_photos(plant, photos_dir, done):
         print(f"[skip] {skipped} photo(s) already in the file", file=sys.stderr)
     if total == 0:
         print("Nothing new to process.", file=sys.stderr)
-        return rows
+        return []
 
-    print(f"Processing {total} photo(s)...", file=sys.stderr)
-    durations = []
-    ok_count = fail_count = 0
+    client = _make_client()          # built once, shared across worker threads
+    workers = max(1, min(workers, total))
+    print(f"Processing {total} photo(s) with {workers} worker(s) via {model} ...", file=sys.stderr)
 
-    for i, img in enumerate(todo, start=1):
+    def work(img):
         name = os.path.basename(img)
-        avg = sum(durations) / len(durations) if durations else None
-        eta = f", ETA ~{avg * (total - i + 1) / 60:0.1f} min" if avg else ""
-        print(f"[{i}/{total}] {name} ... ", end="", flush=True, file=sys.stderr)
-
         t0 = time.time()
         try:
-            extracted = extract_photo(img, plant)
+            extracted = extract_photo(img, plant, model=model, client=client)
             new_rows = normalize_extraction(extracted, plant, name)
-            rows.extend(new_rows)
-            dt = time.time() - t0
-            durations.append(dt)
-            ok_count += 1
-            flagged = sum(1 for r in new_rows if r["needs_review"])
-            print(f"done in {dt:0.0f}s -> {len(new_rows)} rows ({flagged} flagged){eta}",
-                  file=sys.stderr)
-        except Exception as e:
-            dt = time.time() - t0
-            durations.append(dt)
-            fail_count += 1
-            print(f"FAILED after {dt:0.0f}s -> {e}{eta}", file=sys.stderr)
+            return name, new_rows, time.time() - t0, None
+        except Exception as e:  # noqa: BLE001
+            return name, None, time.time() - t0, e
 
-    print(f"Done: {ok_count} succeeded, {fail_count} failed, {len(rows)} total rows extracted.",
-          file=sys.stderr)
+    rows, ok_count, fail_count = [], 0, 0
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(work, img) for img in todo]
+        for i, fut in enumerate(as_completed(futures), start=1):
+            name, new_rows, dt, err = fut.result()
+            if err is None:
+                rows.extend(new_rows)
+                ok_count += 1
+                flagged = sum(1 for r in new_rows if r["needs_review"])
+                print(f"[{i}/{total}] {name} done in {dt:0.0f}s -> "
+                      f"{len(new_rows)} rows ({flagged} flagged)", file=sys.stderr)
+            else:
+                fail_count += 1
+                print(f"[{i}/{total}] {name} FAILED after {dt:0.0f}s -> {err}", file=sys.stderr)
+
+    print(f"Done: {ok_count} succeeded, {fail_count} failed, "
+          f"{len(rows)} total rows extracted.", file=sys.stderr)
     return rows
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Water log-book photos -> Excel (local Ollama).")
+    ap = argparse.ArgumentParser(description="Water log-book photos -> Excel (OpenRouter).")
     ap.add_argument("--plant", required=True, choices=list(PLANTS))
     ap.add_argument("--photos", help="folder of photos (live extraction)")
     ap.add_argument("--from-json", nargs="+", help="glob(s) of pre-extracted JSON (dry run)")
     ap.add_argument("--out", default="plant.xlsx")
+    ap.add_argument("--model", default=DEFAULT_MODEL,
+                    help=f"OpenRouter model slug (default: {DEFAULT_MODEL}). "
+                         f"Try google/gemini-2.5-flash for tougher handwriting.")
+    ap.add_argument("--workers", type=int, default=DEFAULT_WORKERS,
+                    help=f"parallel requests (default: {DEFAULT_WORKERS}; keep low on the free tier)")
     ap.add_argument("--reprocess", action="store_true", help="re-extract even if already in file")
     args = ap.parse_args()
     plant = PLANTS[args.plant]
@@ -417,7 +464,7 @@ def main():
         new = [r for r in _rows_from_json(plant, args.from_json)
                if args.reprocess or r["source_image"] not in done]
     elif args.photos:
-        new = _rows_from_photos(plant, args.photos, done)
+        new = _rows_from_photos(plant, args.photos, done, model=args.model, workers=args.workers)
     else:
         ap.error("provide --photos (live) or --from-json (dry run)")
 
